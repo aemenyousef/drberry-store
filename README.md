@@ -43,3 +43,5 @@ npm run start
 المشروع جاهز ومُهيأ 100% للنشر بنقرة واحدة على:
 - **Vercel (موصى به لـ Next.js):** قم بربط مستودع GitHub وسيقوم Vercel بالبناء والنشر التلقائي.
 - **Netlify أو أي خادم Node.js.**
+
+<!-- Deployment trigger: public repo build -->
