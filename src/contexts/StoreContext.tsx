@@ -1,4 +1,4 @@
-'use client';
+﻿'use client';
 
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { Product } from '@/data/products';
@@ -19,6 +19,10 @@ interface StoreContextType {
   updateQuantity: (productId: string, quantity: number) => void;
   clearCart: () => void;
   cartCount: number;
+  wishlist: string[];
+  toggleWishlist: (productId: string) => void;
+  isInWishlist: (productId: string) => boolean;
+  wishlistCount: number;
   formatPrice: (prices: { SAR: number; YER: number; USD: number }) => string;
   toastMessage: string | null;
 }
@@ -28,9 +32,10 @@ const StoreContext = createContext<StoreContextType | undefined>(undefined);
 export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [currency, setCurrencyState] = useState<Currency>('SAR');
   const [cart, setCart] = useState<CartItem[]>([]);
+  const [wishlist, setWishlist] = useState<string[]>([]);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Load persisted currency and cart from localStorage
+  // Load persisted currency, cart, and wishlist from localStorage
   useEffect(() => {
     try {
       const savedCurrency = localStorage.getItem('drberry_currency') as Currency;
@@ -40,6 +45,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const savedCart = localStorage.getItem('drberry_cart');
       if (savedCart) {
         setCart(JSON.parse(savedCart));
+      }
+      const savedWishlist = localStorage.getItem('drberry_wishlist');
+      if (savedWishlist) {
+        setWishlist(JSON.parse(savedWishlist));
       }
     } catch {
       // Ignore storage errors in SSR / private mode
@@ -112,7 +121,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     } catch {}
   };
 
+  const toggleWishlist = (productId: string) => {
+    setWishlist((prev) => {
+      const exists = prev.includes(productId);
+      const updated = exists ? prev.filter((id) => id !== productId) : [...prev, productId];
+      try {
+        localStorage.setItem('drberry_wishlist', JSON.stringify(updated));
+      } catch {}
+      setToastMessage(exists ? 'تمت الإزالة من المفضلة' : 'تمت الإضافة إلى المفضلة ❤️');
+      setTimeout(() => setToastMessage(null), 2500);
+      return updated;
+    });
+  };
+
+  const isInWishlist = (productId: string) => wishlist.includes(productId);
+
   const cartCount = cart.reduce((sum, item) => sum + item.quantity, 0);
+  const wishlistCount = wishlist.length;
 
   const formatPrice = (prices: { SAR: number; YER: number; USD: number }) => {
     switch (currency) {
@@ -137,6 +162,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         updateQuantity,
         clearCart,
         cartCount,
+        wishlist,
+        toggleWishlist,
+        isInWishlist,
+        wishlistCount,
         formatPrice,
         toastMessage,
       }}

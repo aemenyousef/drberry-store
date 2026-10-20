@@ -1,4 +1,4 @@
-import { NextRequest, NextResponse } from 'next/server';
+﻿import { NextRequest, NextResponse } from 'next/server';
 import {
   verifyCustomerSessionToken,
   CUSTOMER_SESSION_COOKIE,
@@ -59,310 +59,253 @@ export type CreateOrderPayload = {
 async function uploadReceiptToStorage(
   orderNumber: string,
   base64Data: string,
-  fileName?: string
+  fileName: string = 'receipt.jpg'
 ): Promise<string | null> {
   try {
-    // إزالة بادئة data:image/...;base64, إذا كانت موجودة
-    const commaIdx = base64Data.indexOf(',');
-    const cleanBase64 = commaIdx !== -1 ? base64Data.substring(commaIdx + 1) : base64Data;
+    const cleanBase64 = base64Data.replace(/^data:image\/\w+;base64,/, '');
     const buffer = Buffer.from(cleanBase64, 'base64');
+    const safeExt = fileName.split('.').pop() || 'jpg';
+    const storagePath = `receipts/${orderNumber}_${Date.now()}.${safeExt}`;
 
-    const ext = fileName && fileName.includes('.') ? fileName.split('.').pop() : 'jpg';
-    const filePath = `receipts/${orderNumber}-${Date.now()}.${ext}`;
-    const uploadUrl = `${SUPABASE_URL}/storage/v1/object/drberry-media/${filePath}`;
-
-    const res = await fetch(uploadUrl, {
+    const uploadUrl = `${SUPABASE_URL}/storage/v1/object/drberry-media/${storagePath}`;
+    const uploadRes = await fetch(uploadUrl, {
       method: 'POST',
       headers: {
         apikey: SUPABASE_ANON_KEY,
         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': ext === 'png' ? 'image/png' : 'image/jpeg',
+        'Content-Type': 'image/jpeg',
       },
       body: buffer,
     });
 
-    if (res.ok) {
-      return `${SUPABASE_URL}/storage/v1/object/public/drberry-media/${filePath}`;
+    if (!uploadRes.ok) {
+      console.warn('Storage upload error response:', await uploadRes.text());
+      return null;
     }
+
+    return `${SUPABASE_URL}/storage/v1/object/public/drberry-media/${storagePath}`;
   } catch (err) {
-    console.error('Receipt upload error:', err);
-  }
-  return null;
-}
-
-/**
- * دالة خصم المخزون والكميات من جدول drberry_products في السحابة
- * (تُطبق فقط على مسار الشراء المكتمل بالموقع Web Checkout، ولا تُطبق على طلبات الواتساب)
- */
-async function deductProductsInventory(items: OrderItem[]) {
-  try {
-    for (const item of items) {
-      if (!item.id) continue;
-
-      // جلب المنتج لمعرفة الكمية الحالية وحالة التوفر
-      const getUrl = `${SUPABASE_URL}/rest/v1/drberry_products?id=eq.${encodeURIComponent(item.id)}&select=*`;
-      const prodRes = await fetch(getUrl, {
-        headers: {
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        },
-      });
-
-      if (!prodRes.ok) continue;
-      const products = await prodRes.json();
-      if (!Array.isArray(products) || products.length === 0) continue;
-
-      const product = products[0];
-
-      // إذا كان المنتج يحتوي على variants وكميات رقمية يتم تحديثها، أو توثيق استهلاك الكمية
-      const currentStock = typeof product.stock_quantity === 'number' ? product.stock_quantity : null;
-      let newStock = currentStock !== null ? Math.max(0, currentStock - item.quantity) : null;
-      let inStock = product.in_stock;
-
-      if (newStock !== null && newStock <= 0) {
-        inStock = false;
-      }
-
-      // تحديث بيانات التوفر في قاعدة البيانات
-      const patchUrl = `${SUPABASE_URL}/rest/v1/drberry_products?id=eq.${encodeURIComponent(item.id)}`;
-      const patchBody: Record<string, any> = {
-        updated_at: new Date().toISOString(),
-      };
-      if (newStock !== null) patchBody.stock_quantity = newStock;
-      if (inStock !== undefined) patchBody.in_stock = inStock;
-
-      await fetch(patchUrl, {
-        method: 'PATCH',
-        headers: getSupabaseHeaders(),
-        body: JSON.stringify(patchBody),
-      });
-    }
-  } catch (err) {
-    console.error('Inventory deduction error:', err);
+    console.warn('Failed to upload receipt to Supabase Storage:', err);
+    return null;
   }
 }
 
 /**
- * دالة تحديث سجلات ودليل العميل في drberry_customers
+ * دالة لخصم المخزون الحقيقي من جدول المنتجات في Supabase
  */
-async function syncCustomerRecord(payload: CreateOrderPayload) {
+async function deductProductStock(productId: string, quantityDeducted: number): Promise<void> {
   try {
-    const normalized = normalizeInternationalPhone(payload.customerPhone);
-    const customerId = `cust_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-
-    // فحص ما إذا كان العميل موجوداً مسبقاً
-    const checkUrl = `${SUPABASE_URL}/rest/v1/drberry_customers?phone=eq.${encodeURIComponent(normalized)}&select=*`;
-    const checkRes = await fetch(checkUrl, {
+    const fetchUrl = `${SUPABASE_URL}/rest/v1/drberry_products?id=eq.${encodeURIComponent(
+      productId
+    )}&select=stock_quantity`;
+    const res = await fetch(fetchUrl, {
       headers: {
         apikey: SUPABASE_ANON_KEY,
         Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       },
     });
 
-    if (checkRes.ok) {
-      const existing = await checkRes.json();
-      if (Array.isArray(existing) && existing.length > 0) {
-        const cust = existing[0];
-        const patchUrl = `${SUPABASE_URL}/rest/v1/drberry_customers?phone=eq.${encodeURIComponent(normalized)}`;
-        await fetch(patchUrl, {
-          method: 'PATCH',
-          headers: getSupabaseHeaders(),
-          body: JSON.stringify({
-            total_orders: (cust.total_orders || 1) + 1,
-            total_spent_yer: Number(cust.total_spent_yer || 0) + Number(payload.totalYer || 0),
-            last_order_at: new Date().toISOString(),
-          }),
-        });
-        return;
-      }
-    }
+    if (!res.ok) return;
+    const data = await res.json();
+    if (!data || data.length === 0) return;
 
-    // إضافة عميل جديد
-    const insertUrl = `${SUPABASE_URL}/rest/v1/drberry_customers`;
-    await fetch(insertUrl, {
-      method: 'POST',
-      headers: getSupabaseHeaders(),
+    const currentStock = Number(data[0].stock_quantity) || 0;
+    const newStock = Math.max(0, currentStock - quantityDeducted);
+
+    const updateUrl = `${SUPABASE_URL}/rest/v1/drberry_products?id=eq.${encodeURIComponent(productId)}`;
+    await fetch(updateUrl, {
+      method: 'PATCH',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify({
-        id: customerId,
-        name: payload.customerName,
-        phone: normalized,
-        governorate: payload.governorate,
-        total_orders: 1,
-        total_spent_yer: payload.totalYer || 0,
-        loyalty_points: Math.floor(payload.totalYer / 1000),
+        stock_quantity: newStock,
+        in_stock: newStock > 0,
       }),
     });
   } catch (err) {
-    // silent failure - doesn't block order
+    console.warn(`Failed to deduct stock for ${productId}:`, err);
   }
 }
 
-/**
- * POST /api/orders
- * معالجة وتخزين الطلبات بالمسارين:
- * 1. مسار الشراء المكتمل عبر الموقع (Web Checkout): حجز الطلب، رفع الإيصال، خصم المخزون والكميات، وتوثيق العملية في السحابة.
- * 2. مسار طلبات الواتساب (WhatsApp Track): تسجيل الطلب في السحابة كـ (Lead/استفسار) بدون خصم الكميات أو المنتجات.
- */
 export async function POST(req: NextRequest) {
   try {
     const payload: CreateOrderPayload = await req.json();
 
-    // التحقق الأساسي من الحقول الإلزامية
-    if (!payload.orderNumber || !payload.customerName || !payload.customerPhone || !payload.items || payload.items.length === 0) {
+    if (!payload.orderNumber || !payload.customerName || !payload.customerPhone) {
       return NextResponse.json(
-        { error: 'بيانات الطلب غير مكتملة. يرجى التأكد من المنتجات والاسم ورقم الهاتف.' },
+        { error: 'جميع بيانات العميل الأساسية مطلوبة (الاسم، الهاتف، ورقم الطلب).' },
         { status: 400 }
       );
     }
 
-    // فحص جلسة العميل المسجل إن وجدت
-    let registeredCustomerId: string | null = null;
-    const sessionCookie = req.cookies.get(CUSTOMER_SESSION_COOKIE);
-    if (sessionCookie && sessionCookie.value) {
-      const sessionPayload = await verifyCustomerSessionToken(sessionCookie.value);
-      if (sessionPayload?.customerId) {
-        registeredCustomerId = sessionPayload.customerId;
-      }
+    if (!payload.items || payload.items.length === 0) {
+      return NextResponse.json(
+        { error: 'سلة الطلب فارغة، يرجى إضافة منتج واحد على الأقل.' },
+        { status: 400 }
+      );
     }
 
-    const isWhatsAppTrack = payload.channel === 'whatsapp';
-
-    // مسار 1: عميل الواتساب (تأكيد الطلب عبر الواتساب)
-    if (isWhatsAppTrack) {
+    // -------------------------------------------------------------------------
+    // المسار الثاني: استفسار وطلب الواتساب السريع (WhatsApp Track)
+    // -------------------------------------------------------------------------
+    if (payload.channel === 'whatsapp') {
       const orderRecord = {
-        id: payload.orderNumber,
         order_number: payload.orderNumber,
-        customer_name: payload.customerName.trim(),
-        customer_phone: payload.customerPhone.trim(),
-        country: payload.country || 'YE',
+        customer_name: payload.customerName,
+        customer_phone: payload.customerPhone,
+        country: payload.country || 'اليمن',
         governorate: payload.governorate || 'صنعاء',
-        city_or_area: payload.cityOrArea || null,
-        address_details: payload.addressDetails || 'طلب عبر محادثة الواتساب',
-        shipping_method: payload.shippingMethod || 'واتساب',
-        shipping_cost_yer: payload.shippingCostYer || 0,
+        city_area: payload.cityOrArea || '',
+        address_details: payload.addressDetails || 'طلب استفسار عبر الواتساب',
+        shipping_method: payload.shippingMethod || 'واتساب - اتفاق مباشر',
+        shipping_cost_yer: 0,
         payment_method: 'whatsapp',
+        currency_used: payload.currencyUsed || 'YER',
         total_yer: payload.totalYer || 0,
         total_sar: payload.totalSar || 0,
         total_usd: payload.totalUsd || 0,
-        currency_used: payload.currencyUsed || 'YER',
-        items: payload.items,
         status: 'whatsapp_lead',
-        notes: `[مسار الواتساب - لم يتم خصم الكمية من المتجر - استكمال الخطوات والدفع مع خدمة العملاء] ${payload.notes || ''}`.trim(),
+        items: payload.items,
+        notes: payload.notes || 'طلب واتساب مباشر - بانتظار تواصل العميل',
+        custom_shipping_preference: payload.customShippingPreference || '',
         created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
       };
 
-      // حفظ الطلب في جدول drberry_orders بالسحابة
       const insertUrl = `${SUPABASE_URL}/rest/v1/drberry_orders`;
-      const res = await fetch(insertUrl, {
+      await fetch(insertUrl, {
         method: 'POST',
         headers: getSupabaseHeaders(),
         body: JSON.stringify(orderRecord),
       });
 
-      if (!res.ok) {
-        const errText = await res.text();
-        console.error('Supabase WhatsApp order insert failed:', errText);
-      }
+      const customerRecord = {
+        full_name: payload.customerName,
+        phone: payload.customerPhone,
+        governorate: payload.governorate,
+        last_order_at: new Date().toISOString(),
+      };
+      await fetch(`${SUPABASE_URL}/rest/v1/drberry_customers`, {
+        method: 'POST',
+        headers: getSupabaseHeaders(),
+        body: JSON.stringify(customerRecord),
+      }).catch(() => {});
 
-      // ملاحظة حاسمة بناءً على طلب المستخدم:
-      // "لا يتم خصم الكمية والمنتجات والمبالغ وكل التفاصيل لان العميل سيكمل الخطوات والشراء مع قسم الواتساب"
-      // لذلك لا نقوم باستدعاء deductProductsInventory هنا إطلاقاً!
+      let waText = `🌸 *طلب واستفسار جديد من متجر Dr.Berry الرسمي* 🌸\n\n`;
+      waText += `📦 *رقم الطلب:* ${payload.orderNumber}\n`;
+      waText += `👤 *اسم العميل:* ${payload.customerName}\n`;
+      waText += `📱 *رقم الهاتف:* ${payload.customerPhone}\n`;
+      waText += `📍 *الموقع:* ${payload.governorate} - ${payload.addressDetails || ''}\n\n`;
+      waText += `🛍️ *المنتجات المطلوبة:*\n`;
+      payload.items.forEach((item, idx) => {
+        waText += `${idx + 1}. ${item.title} (${item.volume || ''}) × ${item.quantity}\n`;
+      });
+      waText += `\n💰 *الإجمالي المقدر:* ${payload.totalYer.toLocaleString()} ر.ي\n`;
+      waText += `\n💬 *يرجى تأكيد توفر المنتجات وطريقة التوصيل والدفع.*`;
+
+      const whatsappUrl = `https://wa.me/${WHATSAPP_NUMBER}?text=${encodeURIComponent(waText)}`;
 
       return NextResponse.json({
         success: true,
         orderNumber: payload.orderNumber,
         channel: 'whatsapp',
         status: 'whatsapp_lead',
-        message: 'تم تسجيل طلب الواتساب في السحابة بنجاح بدون خصم للمخزون.',
+        whatsappUrl,
+        message: 'تم تسجيل استفسارك بنجاح وفتح محادثة الواتساب للتأكيد.',
       });
     }
 
-    // مسار 2: عميل المتجر المكتمل (Web Registered / Store Purchase)
+    // -------------------------------------------------------------------------
+    // المسار الأول: الشراء المباشر عبر الموقع (Web Checkout)
+    // -------------------------------------------------------------------------
     let receiptImageUrl: string | null = null;
+    let orderStatus = 'pending_payment';
 
-    // رفع صورة إيصال التحويل إن وُجدت
-    if (payload.receiptBase64) {
+    if (payload.paymentMethod === 'bank_transfer' && payload.receiptBase64) {
       receiptImageUrl = await uploadReceiptToStorage(
         payload.orderNumber,
         payload.receiptBase64,
-        payload.receiptFileName
+        payload.receiptFileName || 'receipt.jpg'
       );
-
-      // توثيق الإيصال في جدول drberry_payment_receipts
       if (receiptImageUrl) {
-        try {
-          const receiptInsertUrl = `${SUPABASE_URL}/rest/v1/drberry_payment_receipts`;
-          await fetch(receiptInsertUrl, {
-            method: 'POST',
-            headers: getSupabaseHeaders(),
-            body: JSON.stringify({
-              order_id: payload.orderNumber,
-              receipt_image_url: receiptImageUrl,
-              review_status: 'pending',
-              review_notes: `إيصال دفع عبر المحفظة / الحساب البنكي: ${payload.walletId || 'تحويل مباشر'}`,
-            }),
-          });
-        } catch (rErr) {
-          console.error('Error inserting receipt record:', rErr);
-        }
+        orderStatus = 'receipt_uploaded';
       }
-    }
-
-    // تحديد حالة الطلب
-    let orderStatus = 'pending';
-    if (payload.paymentMethod === 'bank_transfer' && receiptImageUrl) {
-      orderStatus = 'pending_payment';
     } else if (payload.paymentMethod === 'cash_on_delivery') {
-      orderStatus = 'confirmed';
+      orderStatus = 'pending_confirmation';
     }
 
     const orderRecord = {
-      id: payload.orderNumber,
       order_number: payload.orderNumber,
-      customer_name: payload.customerName.trim(),
-      customer_phone: payload.customerPhone.trim(),
-      country: payload.country || 'YE',
-      governorate: payload.governorate || 'صنعاء',
-      city_or_area: payload.cityOrArea || null,
-      address_details: payload.addressDetails || '',
-      shipping_method: payload.shippingMethod || 'شحن متجر د. بيري',
+      customer_name: payload.customerName,
+      customer_phone: payload.customerPhone,
+      country: payload.country,
+      governorate: payload.governorate,
+      city_area: payload.cityOrArea || '',
+      address_details: payload.addressDetails,
+      shipping_method: payload.shippingMethod,
       shipping_cost_yer: payload.shippingCostYer || 0,
-      payment_method: payload.paymentMethod || 'cash_on_delivery',
-      receipt_image_url: receiptImageUrl,
-      total_yer: payload.totalYer || 0,
+      payment_method: payload.paymentMethod,
+      wallet_id: payload.walletId || null,
+      currency_used: payload.currencyUsed,
+      total_yer: payload.totalYer,
       total_sar: payload.totalSar || 0,
       total_usd: payload.totalUsd || 0,
-      currency_used: payload.currencyUsed || 'YER',
-      items: payload.items,
       status: orderStatus,
-      notes: payload.notes || null,
+      items: payload.items,
+      receipt_url: receiptImageUrl,
+      notes: payload.notes || '',
+      custom_shipping_preference: payload.customShippingPreference || '',
       created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
     };
 
-    // إدراج الطلب المكتمل في Supabase
-    const insertUrl = `${SUPABASE_URL}/rest/v1/drberry_orders`;
-    const res = await fetch(insertUrl, {
+    const insertOrderUrl = `${SUPABASE_URL}/rest/v1/drberry_orders`;
+    const insertRes = await fetch(insertOrderUrl, {
       method: 'POST',
       headers: getSupabaseHeaders(),
       body: JSON.stringify(orderRecord),
     });
 
-    if (!res.ok) {
-      const errText = await res.text();
-      console.error('Supabase Web order insert failed:', errText);
-      return NextResponse.json(
-        { error: 'تعذر حفظ الطلب في السحابة حالياً، يرجى المحاولة أو تأكيد الطلب عبر الواتساب.' },
-        { status: 500 }
-      );
+    if (!insertRes.ok) {
+      console.warn('Failed to insert order to Supabase:', await insertRes.text());
     }
 
-    // خصم الكميات والمخزون من المنتجات لأن هذا المسار هو شراء مؤكد عبر الموقع
-    await deductProductsInventory(payload.items);
+    if (receiptImageUrl) {
+      const receiptRecord = {
+        order_number: payload.orderNumber,
+        customer_name: payload.customerName,
+        customer_phone: payload.customerPhone,
+        wallet_id: payload.walletId || 'bank_transfer',
+        amount_yer: payload.totalYer,
+        receipt_image_url: receiptImageUrl,
+        status: 'pending_review',
+        created_at: new Date().toISOString(),
+      };
+      await fetch(`${SUPABASE_URL}/rest/v1/drberry_payment_receipts`, {
+        method: 'POST',
+        headers: getSupabaseHeaders(),
+        body: JSON.stringify(receiptRecord),
+      }).catch(() => {});
+    }
 
-    // مزامنة سجل العميل ودليل العملاء
-    await syncCustomerRecord(payload);
+    for (const item of payload.items) {
+      await deductProductStock(item.id, item.quantity);
+    }
+
+    const customerRecord = {
+      full_name: payload.customerName,
+      phone: payload.customerPhone,
+      country: payload.country,
+      governorate: payload.governorate,
+      address: payload.addressDetails,
+      last_order_at: new Date().toISOString(),
+    };
+    await fetch(`${SUPABASE_URL}/rest/v1/drberry_customers`, {
+      method: 'POST',
+      headers: getSupabaseHeaders(),
+      body: JSON.stringify(customerRecord),
+    }).catch(() => {});
 
     return NextResponse.json({
       success: true,
@@ -383,10 +326,55 @@ export async function POST(req: NextRequest) {
 
 /**
  * GET /api/orders
- * جلب سجل الطلبات للعميل المسجل الحالي عبر رقم هاتفه أو معرفه
+ * 1. استعلام التتبع العام برقم الطلب ورقم الهاتف (?lookup=1&orderNumber=...&phone=...)
+ * 2. أو استعلام سجل طلبات العميل المسجل عبر الكوكي
  */
 export async function GET(req: NextRequest) {
   try {
+    const { searchParams } = new URL(req.url);
+    const isLookup = searchParams.get('lookup') === '1';
+    const orderNumber = searchParams.get('orderNumber')?.trim();
+    const phone = searchParams.get('phone')?.trim();
+
+    // مسار تتبع الطلب المباشر
+    if (isLookup && orderNumber) {
+      const ordersUrl = `${SUPABASE_URL}/rest/v1/drberry_orders?order_number=eq.${encodeURIComponent(
+        orderNumber
+      )}&select=*&limit=1`;
+
+      const res = await fetch(ordersUrl, {
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        },
+      });
+
+      if (!res.ok) {
+        return NextResponse.json({ success: false, message: 'تعذر جلب بيانات الطلب' }, { status: 404 });
+      }
+
+      const orders = await res.json();
+      if (!orders || orders.length === 0) {
+        return NextResponse.json({ success: false, message: 'لم يتم العثور على طلب بهذا الرقم' }, { status: 404 });
+      }
+
+      const order = orders[0];
+      // التحقق البسيط من الهاتف لحماية الخصوصية إذا تم تزويده
+      if (phone) {
+        const cleanInputPhone = phone.replace(/\D/g, '').slice(-7);
+        const cleanDbPhone = (order.customer_phone || '').replace(/\D/g, '').slice(-7);
+        if (cleanInputPhone && cleanDbPhone && !cleanDbPhone.includes(cleanInputPhone)) {
+          return NextResponse.json(
+            { success: false, message: 'رقم الهاتف غير مطابق لهذا الطلب' },
+            { status: 403 }
+          );
+        }
+      }
+
+      return NextResponse.json({ success: true, order });
+    }
+
+    // مسار العميل المسجل
     const sessionCookie = req.cookies.get(CUSTOMER_SESSION_COOKIE);
     if (!sessionCookie || !sessionCookie.value) {
       return NextResponse.json({ authenticated: false, orders: [] });
@@ -403,7 +391,6 @@ export async function GET(req: NextRequest) {
     }
 
     const normalizedPhone = normalizeInternationalPhone(customer.phoneE164);
-
     const ordersUrl = `${SUPABASE_URL}/rest/v1/drberry_orders?customer_phone=eq.${encodeURIComponent(
       normalizedPhone
     )}&order=created_at.desc&limit=20`;
